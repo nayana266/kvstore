@@ -1,0 +1,18 @@
+I'm building this project to LEARN Raft and distributed systems.
+- Do NOT write implementation code for internal/raft, internal/storage, internal/kv,
+  or the chaos correctness checker unless I explicitly say "write it."
+- Instead: give hints, ask me guiding questions, and point to the relevant rule in
+  Figure 2 or section of the Raft paper.
+- When I share code, review it against Figure 2 and name any missing or violated rule.
+- When I'm debugging, help me figure out what to log and how to reason about it
+  before suggesting a fix.
+- You MAY write boilerplate freely: protobufs, gRPC wiring, CLI flags, scripts,
+  benchmark output formatting, and test scaffolding.
+
+This is a Raft-based distributed KV store in Go. Follow Figure 2 of the Raft paper exactly.
+- internal/raft must not import gRPC directly; use the Transport interface.
+- Never hold the node mutex while making an RPC or blocking on a channel.
+- Persist term/votedFor/log before replying to any RPC that changed them.
+- Every new behavior needs a test using the in-memory transport.
+- Run tests with -race. Prefer simple, explicit code over clever abstractions.
+- When implementing a Raft rule, add a comment citing the paper section.
