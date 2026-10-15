@@ -39,6 +39,20 @@ type Node struct {
 	votedFor         string
 	log              []*pb.LogEntry
 	role             Role
+
+	// Phase 2: Figure 2 volatile state + leader replication progress.
+	commitIndex uint64
+	lastApplied uint64
+	nextIndex   map[string]uint64 // per-peer; only meaningful when leader
+	matchIndex  map[string]uint64 // per-peer; only meaningful when leader
+	applied     [][]byte          // command payloads applied in order (test-facing)
+}
+
+// LogEntryView is a read-only snapshot of one log entry for tests.
+type LogEntryView struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
 }
 
 var _ Handler = (*Node)(nil)
@@ -125,22 +139,45 @@ func (n *Node) startElection() {
 	}
 }
 
-// sendHeartbeats sends empty AppendEntries to every peer.
+// sendHeartbeats / replicate: send AppendEntries to every peer (§5.3).
 // The caller must hold n.mu.
 func (n *Node) sendHeartbeats() {
 	n.lastHeartbeat = time.Now()
-	lastIndex, lastTerm := n.lastLogInfo()
+	for _, peer := range n.peers {
+		n.sendAppendEntries(peer)
+	}
+}
+
+// sendAppendEntries builds a peer-specific AppendEntries and sends it.
+// The caller must hold n.mu. Must not hold the lock during the RPC itself
+// (go starts the send without waiting).
+func (n *Node) sendAppendEntries(peer string) {
+	next := n.nextIndex[peer]
+	if next < 1 {
+		next = 1
+	}
+
+	prevLogIndex := next - 1
+	prevLogTerm := uint64(0)
+	if prevLogIndex > 0 {
+		prevLogTerm = n.log[prevLogIndex-1].Term
+	}
+
+	// Entries from Raft index `next` through the end of the log.
+	var entries []*pb.LogEntry
+	if next <= uint64(len(n.log)) {
+		entries = n.log[next-1:]
+	}
+
 	req := &pb.AppendEntriesRequest{
 		Term:         n.currentTerm,
 		LeaderId:     n.id,
-		PrevLogIndex: lastIndex,
-		PrevLogTerm:  lastTerm,
-		Entries:      nil, // empty = heartbeat
-		LeaderCommit: 0,   // Phase 2 will track commitIndex
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
 	}
-	for _, peer := range n.peers {
-		go n.appendEntries(peer, req)
-	}
+	go n.appendEntries(peer, req)
 }
 
 // appendEntries sends one AppendEntries RPC and handles the reply.
@@ -159,6 +196,83 @@ func (n *Node) appendEntries(peer string, req *pb.AppendEntriesRequest) {
 		n.role = Follower
 		n.votedFor = ""
 		n.resetElectionTimer()
+		return
+	}
+
+	// Ignore replies from an old leadership term.
+	if n.role != Leader || req.Term != n.currentTerm {
+		return
+	}
+
+	if resp.Success {
+		// Figure 2, Rules for Servers (leaders): update matchIndex / nextIndex (§5.3).
+		match := req.PrevLogIndex + uint64(len(req.Entries))
+		if match > n.matchIndex[peer] {
+			n.matchIndex[peer] = match
+		}
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.maybeCommit()
+		n.applyCommitted()
+		return
+	}
+
+	// AppendEntries failed: step nextIndex back and retry.
+	// Fast backtracking using conflictTerm / conflictIndex (end of §5.3).
+	if resp.ConflictIndex > 0 {
+		next := resp.ConflictIndex
+		if resp.ConflictTerm > 0 {
+			last := uint64(0)
+			for _, e := range n.log {
+				if e.Term == resp.ConflictTerm {
+					last = e.Index
+				}
+			}
+			if last > 0 {
+				next = last + 1
+			}
+		}
+		if next < 1 {
+			next = 1
+		}
+		n.nextIndex[peer] = next
+	} else if n.nextIndex[peer] > 1 {
+		n.nextIndex[peer]--
+	}
+	n.sendAppendEntries(peer)
+}
+
+// maybeCommit advances commitIndex if a majority has replicated an entry from
+// the current term (Figure 2 leader rule; Figure 8 / §5.4.2).
+// The caller must hold n.mu.
+func (n *Node) maybeCommit() {
+	majority := (len(n.peers)+1)/2 + 1
+	lastIndex, _ := n.lastLogInfo()
+	for N := lastIndex; N > n.commitIndex; N-- {
+		// Figure 8: only commit entries from the current term this way.
+		if n.log[N-1].Term != n.currentTerm {
+			continue
+		}
+		count := 1 // the leader itself has the entry
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= N {
+				count++
+			}
+		}
+		if count >= majority {
+			n.commitIndex = N
+			return
+		}
+	}
+}
+
+// applyCommitted applies log[lastApplied+1 .. commitIndex] to the state machine
+// in order (Figure 2, Rules for Servers — all servers).
+// The caller must hold n.mu.
+func (n *Node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		data := n.log[n.lastApplied-1].Data
+		n.applied = append(n.applied, append([]byte(nil), data...))
 	}
 }
 
@@ -192,6 +306,13 @@ func (n *Node) requestVote(peer string, req *pb.RequestVoteRequest) {
 		majority := (len(n.peers)+1)/2 + 1
 		if n.votes >= majority {
 			n.role = Leader
+			n.nextIndex = make(map[string]uint64)
+			n.matchIndex = make(map[string]uint64)
+			lastIndex, _ := n.lastLogInfo()
+			for _, peer := range n.peers {
+				n.nextIndex[peer] = lastIndex + 1 // optimistic (Figure 2)
+				n.matchIndex[peer] = 0
+			}
 			n.lastHeartbeat = time.Time{} // send heartbeats immediately in tick()
 			// TODO(Phase 1): step 6 will send heartbeats from tick()
 		}
@@ -203,6 +324,69 @@ func (n *Node) State() (term uint64, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.currentTerm, n.role == Leader
+}
+
+// Propose asks this node to append cmd to the Raft log.
+// Returns false if this node is not the leader (caller should retry elsewhere).
+func (n *Node) Propose(cmd []byte) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// 1) Only the leader accepts client commands (Figure 2 / §5.3).
+	if n.role != Leader {
+		return false
+	}
+
+	// 2) New entry goes at the end of the log.
+	lastIndex, _ := n.lastLogInfo() // hint: last log index + 1. Use n.lastLogInfo()
+	index := lastIndex + 1
+	entry := &pb.LogEntry{
+		Term:  n.currentTerm, // this leader's term
+		Index: index,
+		Type:  pb.EntryType_ENTRY_TYPE_NORMAL,
+		Data:  cmd,
+	}
+	n.log = append(n.log, entry)
+
+	// 3) Optional for later: kick replication immediately so you don't wait
+	//    for the next 50ms heartbeat. You can leave this out for now.
+	n.sendHeartbeats()
+
+	return true
+}
+
+// Applied returns a copy of command payloads applied to the state machine,
+// in commit order (Figure 2, All Servers: apply when commitIndex > lastApplied).
+func (n *Node) Applied() [][]byte {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([][]byte, len(n.applied))
+	for i, cmd := range n.applied {
+		out[i] = append([]byte(nil), cmd...)
+	}
+	return out
+}
+
+// LogEntries returns a snapshot of the Raft log for tests.
+func (n *Node) LogEntries() []LogEntryView {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]LogEntryView, len(n.log))
+	for i, e := range n.log {
+		out[i] = LogEntryView{
+			Index: e.Index,
+			Term:  e.Term,
+			Data:  append([]byte(nil), e.Data...),
+		}
+	}
+	return out
+}
+
+// CommitIndex returns the highest log index known to be committed.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
 }
 
 // HandleRequestVote is called when a candidate asks this node for its vote.
@@ -278,7 +462,52 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	n.role = Follower
 	n.resetElectionTimer()
 
-	// TODO(Phase 2): log consistency check and appending entries (Figure 2,
-	// AppendEntries receiver rules 2–5).
+	// Figure 2, AppendEntries receiver rule 2: log consistency check.
+	// On failure, return conflictTerm/conflictIndex for fast backtracking (§5.3).
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex > uint64(len(n.log)) {
+			return &pb.AppendEntriesResponse{
+				Term:          n.currentTerm,
+				Success:       false,
+				ConflictTerm:  0,
+				ConflictIndex: uint64(len(n.log)) + 1,
+			}
+		}
+		if n.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+			conflictTerm := n.log[req.PrevLogIndex-1].Term
+			conflictIndex := req.PrevLogIndex
+			for conflictIndex > 1 && n.log[conflictIndex-2].Term == conflictTerm {
+				conflictIndex--
+			}
+			return &pb.AppendEntriesResponse{
+				Term:          n.currentTerm,
+				Success:       false,
+				ConflictTerm:  conflictTerm,
+				ConflictIndex: conflictIndex,
+			}
+		}
+	}
+
+	// Figure 2, AppendEntries receiver rules 3–4: truncate conflicts, then append.
+	for i, entry := range req.Entries {
+		idx := req.PrevLogIndex + uint64(i) + 1
+		if idx <= uint64(len(n.log)) {
+			if n.log[idx-1].Term != entry.Term {
+				n.log = n.log[:idx-1] // delete conflicting entry and everything after
+				n.log = append(n.log, entry)
+			}
+			// else: identical entry already present; leave it
+		} else {
+			n.log = append(n.log, entry)
+		}
+	}
+
+	// Figure 2, AppendEntries receiver rule 5: adopt leader's commit index.
+	if req.LeaderCommit > n.commitIndex {
+		lastIndex, _ := n.lastLogInfo()
+		n.commitIndex = min(req.LeaderCommit, lastIndex)
+	}
+	n.applyCommitted()
+
 	return &pb.AppendEntriesResponse{Term: n.currentTerm, Success: true}
 }

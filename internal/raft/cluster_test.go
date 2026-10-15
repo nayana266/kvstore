@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"slices"
 	"sync"
@@ -12,6 +13,7 @@ const (
 	// leaderWait is how long to wait for an election to settle. Election
 	// timeouts are 150–300ms, so this allows for a few split votes.
 	leaderWait   = 2 * time.Second
+	applyWait    = 3 * time.Second
 	pollInterval = 10 * time.Millisecond
 )
 
@@ -141,3 +143,75 @@ func without(ids []string, exclude ...string) []string {
 	}
 	return out
 }
+
+// propose asks the current leader among ids to append cmd, retrying across
+// leader changes until someone accepts it.
+func (c *testCluster) propose(ids []string, cmd []byte) {
+	c.t.Helper()
+	deadline := time.Now().Add(applyWait)
+	for time.Now().Before(deadline) {
+		leader, _ := c.checkOneLeader(ids)
+		if c.nodes[leader].Propose(cmd) {
+			return
+		}
+		time.Sleep(pollInterval)
+	}
+	c.t.Fatalf("could not propose %q to a leader among %v within %v", cmd, ids, applyWait)
+}
+
+// waitApplied waits until every id has at least n applied commands.
+func (c *testCluster) waitApplied(ids []string, n int) {
+	c.t.Helper()
+	deadline := time.Now().Add(applyWait)
+	for time.Now().Before(deadline) {
+		ok := true
+		for _, id := range ids {
+			if len(c.nodes[id].Applied()) < n {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		time.Sleep(pollInterval)
+	}
+	for _, id := range ids {
+		c.t.Logf("%s applied=%v commit=%d log=%v",
+			id, cmds(c.nodes[id].Applied()), c.nodes[id].CommitIndex(), c.nodes[id].LogEntries())
+	}
+	c.t.Fatalf("timed out waiting for %d applied entries on %v", n, ids)
+}
+
+// checkSameApplied requires every id to have exactly the same applied list.
+func (c *testCluster) checkSameApplied(ids []string, want [][]byte) {
+	c.t.Helper()
+	for _, id := range ids {
+		got := c.nodes[id].Applied()
+		if !equalCmds(got, want) {
+			c.t.Fatalf("%s applied %v, want %v", id, cmds(got), cmds(want))
+		}
+	}
+}
+
+func equalCmds(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func cmds(in [][]byte) []string {
+	out := make([]string, len(in))
+	for i, c := range in {
+		out[i] = string(c)
+	}
+	return out
+}
+
+func cmd(s string) []byte { return []byte(s) }
