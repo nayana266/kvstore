@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package kvstore.kv;
+
+option go_package = "kvstore/proto/kvpb;kvpb";
+
+// Client-facing API. Only the leader serves requests; other nodes return
+// STATUS_NOT_LEADER with a leader_hint so the client can retry there.
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  rpc AddServer(AddServerRequest) returns (AddServerResponse);
+  rpc RemoveServer(RemoveServerRequest) returns (RemoveServerResponse);
+}
+
+enum Status {
+  STATUS_OK = 0;
+  STATUS_NOT_LEADER = 1;
+  STATUS_TIMEOUT = 2;                   // entry not applied in time; safe to retry with the same seq
+  STATUS_CONFIG_CHANGE_IN_PROGRESS = 3; // only one membership change at a time
+}
+
+// client_id + seq identify a write so retries are applied at most once.
+// seq must increase monotonically per client.
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  string client_id = 3;
+  uint64 seq = 4;
+}
+
+message PutResponse {
+  Status status = 1;
+  string leader_hint = 2; // address of the believed leader; empty if unknown
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  Status status = 1;
+  string leader_hint = 2;
+  bool found = 3;
+  bytes value = 4;
+}
+
+message DeleteRequest {
+  string key = 1;
+  string client_id = 2;
+  uint64 seq = 3;
+}
+
+message DeleteResponse {
+  Status status = 1;
+  string leader_hint = 2;
+}
+
+message AddServerRequest {
+  string id = 1;
+  string addr = 2;
+}
+
+message AddServerResponse {
+  Status status = 1;
+  string leader_hint = 2;
+}
+
+message RemoveServerRequest {
+  string id = 1;
+}
+
+message RemoveServerResponse {
+  Status status = 1;
+  string leader_hint = 2;
+}
