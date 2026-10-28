@@ -25,3 +25,9 @@ If candidate's term is higher than the node's own, the node first switches to th
 ## Phase 2 : Log Replication
 A follower rejects AppendEntries if either the leader's term is old or the log does not match.
 The leader may set commitIndex to N when a majority of the cluster has that entry and log[N].term == currentTerm.
+
+## Phase 3:
+currentTerm, votedFor, and the log go to disk. They record promises a node has made to the rest of the cluster: which term it's in, who it voted for, and which entries it has accepted. Forgetting any of them could let the node break a promise after a restart.
+Everything else can be rebuilt. A restarted node starts as a follower. The leader tells it the commit index in the next AppendEntries, and it re-applies entries from its saved log. A new leader sets up nextIndex and matchIndex from scratch anyway.
+If it replies first and crashes before saving, it restarts with no memory of the vote. It could then vote for a different candidate in the same term. Both candidates could reach a majority, giving two leaders in one term, which Raft must never allow. Saving first means a "yes" that left the node is always on disk.
+The same idea applies to the log. A follower must save new entries before replying Success: true, because the leader counts that reply toward a majority when deciding what's committed.

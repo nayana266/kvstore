@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	pb "kvstore/proto/raftpb"
 	"math/rand"
 	"sync"
@@ -13,6 +14,7 @@ type Config struct {
 	ID        string    // this server's ID
 	Peers     []string  // IDs of all other servers in the cluster
 	Transport Transport // used to send RPCs to peers
+	Storage   Storage   // durable home for currentTerm, votedFor, and log[]
 }
 
 // Role is a server's current role.
@@ -30,6 +32,7 @@ type Node struct {
 	done      chan struct{}
 	peers     []string
 	transport Transport
+	storage   Storage
 
 	mu               sync.Mutex
 	votes            int
@@ -58,12 +61,23 @@ type LogEntryView struct {
 var _ Handler = (*Node)(nil)
 
 func NewNode(cfg Config) *Node {
-	return &Node{
+	n := &Node{
 		id:        cfg.ID,
 		peers:     cfg.Peers,
 		transport: cfg.Transport,
+		storage:   cfg.Storage,
 		done:      make(chan struct{}),
 	}
+
+	// Figure 2, "Persistent state": restore what was saved before a restart.
+	term, votedFor, log, err := cfg.Storage.Load()
+	if err != nil {
+		panic(fmt.Sprintf("raft: loading storage for %s: %v", cfg.ID, err))
+	}
+	n.currentTerm = term
+	n.votedFor = votedFor
+	n.log = log
+	return n
 }
 
 // Start launches the node's background goroutines (election timer,
@@ -123,6 +137,7 @@ func (n *Node) startElection() {
 	n.currentTerm = n.currentTerm + 1
 	n.role = Candidate
 	n.votedFor = n.id
+	n.persistState()
 	n.resetElectionTimer()
 
 	n.votes = 1
@@ -163,10 +178,12 @@ func (n *Node) sendAppendEntries(peer string) {
 		prevLogTerm = n.log[prevLogIndex-1].Term
 	}
 
-	// Entries from Raft index `next` through the end of the log.
+	// Entries from Raft index `next` through the end of the log. Copied because
+	// the RPC goroutine reads them without n.mu, and a later truncate+append
+	// would overwrite the shared backing array.
 	var entries []*pb.LogEntry
 	if next <= uint64(len(n.log)) {
-		entries = n.log[next-1:]
+		entries = append([]*pb.LogEntry(nil), n.log[next-1:]...)
 	}
 
 	req := &pb.AppendEntriesRequest{
@@ -195,6 +212,7 @@ func (n *Node) appendEntries(peer string, req *pb.AppendEntriesRequest) {
 		n.currentTerm = resp.Term
 		n.role = Follower
 		n.votedFor = ""
+		n.persistState()
 		n.resetElectionTimer()
 		return
 	}
@@ -292,6 +310,7 @@ func (n *Node) requestVote(peer string, req *pb.RequestVoteRequest) {
 		n.currentTerm = resp.Term
 		n.role = Follower
 		n.votedFor = ""
+		n.persistState()
 		return
 	}
 
@@ -347,7 +366,7 @@ func (n *Node) Propose(cmd []byte) bool {
 		Data:  cmd,
 	}
 	n.log = append(n.log, entry)
-
+	n.persistAppend(entry)
 	// 3) Optional for later: kick replication immediately so you don't wait
 	//    for the next 50ms heartbeat. You can leave this out for now.
 	n.sendHeartbeats()
@@ -405,6 +424,7 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 		n.currentTerm = req.Term
 		n.role = Follower
 		n.votedFor = ""
+		n.persistState()
 	}
 
 	// §5.4.1: the candidate's log is at least as up-to-date if its last term is
@@ -417,7 +437,7 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 	// and only for an up-to-date candidate (§5.4.1).
 	if (n.votedFor == "" || n.votedFor == req.CandidateId) && upToDate {
 		n.votedFor = req.CandidateId
-
+		n.persistState()
 		n.resetElectionTimer()
 		return &pb.RequestVoteResponse{Term: n.currentTerm, VoteGranted: true}
 	}
@@ -441,6 +461,31 @@ func (n *Node) resetElectionTimer() {
 	n.electionDeadline = time.Now().Add(timeout)
 }
 
+// persistState saves currentTerm and votedFor (Figure 2, "Persistent state").
+// The caller must hold n.mu, and must call it before replying to or sending
+// any RPC that depends on the new values.
+func (n *Node) persistState() {
+	if err := n.storage.SaveState(n.currentTerm, n.votedFor); err != nil {
+		panic(fmt.Sprintf("raft: saving state for %s: %v", n.id, err))
+	}
+}
+
+// persistTruncate deletes stored entries with Index >= index.
+// The caller must hold n.mu.
+func (n *Node) persistTruncate(index uint64) {
+	if err := n.storage.TruncateFrom(index); err != nil {
+		panic(fmt.Sprintf("raft: truncating log for %s: %v", n.id, err))
+	}
+}
+
+// persistAppend adds entries to the end of the stored log.
+// The caller must hold n.mu.
+func (n *Node) persistAppend(entries ...*pb.LogEntry) {
+	if err := n.storage.Append(entries); err != nil {
+		panic(fmt.Sprintf("raft: appending to log for %s: %v", n.id, err))
+	}
+}
+
 // HandleAppendEntries is called when a leader sends entries or a heartbeat.
 func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntriesResponse {
 	n.mu.Lock()
@@ -455,6 +500,7 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	if req.Term > n.currentTerm {
 		n.currentTerm = req.Term
 		n.votedFor = ""
+		n.persistState()
 	}
 
 	// §5.2: the sender is the leader for this term, so this node is a follower.
@@ -489,16 +535,20 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	}
 
 	// Figure 2, AppendEntries receiver rules 3–4: truncate conflicts, then append.
+	// Each change is saved before the reply below (Figure 2, "Persistent state").
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + uint64(i) + 1
 		if idx <= uint64(len(n.log)) {
 			if n.log[idx-1].Term != entry.Term {
 				n.log = n.log[:idx-1] // delete conflicting entry and everything after
+				n.persistTruncate(idx)
 				n.log = append(n.log, entry)
+				n.persistAppend(entry)
 			}
 			// else: identical entry already present; leave it
 		} else {
 			n.log = append(n.log, entry)
+			n.persistAppend(entry)
 		}
 	}
 

@@ -36,7 +36,7 @@ func TestFollowerCatchUp(t *testing.T) {
 	c.waitApplied(without(c.ids, follower), 2)
 
 	// Isolated follower must not have the second command yet.
-	if got := c.nodes[follower].Applied(); len(got) >= 2 {
+	if got := c.node(follower).Applied(); len(got) >= 2 {
 		t.Fatalf("disconnected follower unexpectedly applied %v", cmds(got))
 	}
 
@@ -60,7 +60,7 @@ func TestOverwriteUncommitted(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	submitted := false
 	for time.Now().Before(deadline) {
-		if c.nodes[oldLeader].Propose(cmd("orphan")) {
+		if c.node(oldLeader).Propose(cmd("orphan")) {
 			submitted = true
 			break
 		}
@@ -90,7 +90,7 @@ func TestOverwriteUncommitted(t *testing.T) {
 
 	// Every node must apply "winner". None may apply "orphan".
 	for _, id := range c.ids {
-		got := c.nodes[id].Applied()
+		got := c.node(id).Applied()
 		for _, a := range got {
 			if bytes.Equal(a, cmd("orphan")) {
 				t.Fatalf("%s applied uncommitted orphan from old leader: %v", id, cmds(got))
@@ -103,7 +103,7 @@ func TestOverwriteUncommitted(t *testing.T) {
 
 	// Logs must agree on the committed prefix (winner at index 1).
 	for _, id := range c.ids {
-		log := c.nodes[id].LogEntries()
+		log := c.node(id).LogEntries()
 		if len(log) < 1 || !bytes.Equal(log[0].Data, cmd("winner")) {
 			t.Fatalf("%s log %v does not start with winner", id, log)
 		}
@@ -148,12 +148,12 @@ func TestFigure8CommitRestriction(t *testing.T) {
 	// the log depending on elections, but Applied on the majority must end
 	// with "new" and stay identical across the majority.
 	for _, id := range majority {
-		got := c.nodes[id].Applied()
+		got := c.node(id).Applied()
 		if len(got) == 0 || !bytes.Equal(got[len(got)-1], cmd("new")) {
 			t.Fatalf("%s applied %v; last entry should be new", id, cmds(got))
 		}
 	}
-	majApplied := c.nodes[majority[0]].Applied()
+	majApplied := c.node(majority[0]).Applied()
 	c.checkSameApplied(majority, majApplied)
 
 	c.net.Heal()
@@ -163,7 +163,7 @@ func TestFigure8CommitRestriction(t *testing.T) {
 
 	// Safety: no node applied a command the majority never committed.
 	for _, id := range c.ids {
-		got := c.nodes[id].Applied()
+		got := c.node(id).Applied()
 		if len(got) != len(majApplied) {
 			t.Fatalf("%s applied %v, majority has %v", id, cmds(got), cmds(majApplied))
 		}
