@@ -67,6 +67,33 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, to string, req *pb.Ap
 	return cl.AppendEntries(ctx, req)
 }
 
+// SetPeer registers or updates the dial address for a peer (Phase 5 AddServer).
+func (t *GRPCTransport) SetPeer(id, addr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if old, ok := t.conns[id]; ok {
+		_ = old.Close()
+		delete(t.conns, id)
+		delete(t.clients, id)
+	}
+	if t.peers == nil {
+		t.peers = map[string]string{}
+	}
+	t.peers[id] = addr
+}
+
+// RemovePeer drops a peer address and any cached connection.
+func (t *GRPCTransport) RemovePeer(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if old, ok := t.conns[id]; ok {
+		_ = old.Close()
+		delete(t.conns, id)
+		delete(t.clients, id)
+	}
+	delete(t.peers, id)
+}
+
 func (t *GRPCTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()

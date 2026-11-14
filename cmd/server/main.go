@@ -74,7 +74,7 @@ func main() {
 	raft.ServeRaft(srv, node)
 
 	store := kv.NewStore()
-	kvSvc := kv.NewService(node, store, applyCh, allAddrs)
+	kvSvc := kv.NewServiceWithPeers(node, store, applyCh, allAddrs, tr)
 	pb.RegisterKVServer(srv, kvSvc)
 
 	node.Start()

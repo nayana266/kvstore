@@ -128,7 +128,10 @@ func (c *testCluster) monitorLeaders() {
 		case <-c.stopMonitor:
 			return
 		case <-ticker.C:
-			for _, id := range c.ids {
+			c.mu.Lock()
+			ids := append([]string(nil), c.ids...)
+			c.mu.Unlock()
+			for _, id := range ids {
 				term, isLeader := c.node(id).State()
 				if !isLeader {
 					continue

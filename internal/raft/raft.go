@@ -3,22 +3,27 @@ package raft
 import (
 	"context"
 	"fmt"
-	pb "kvstore/proto/raftpb"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
+
+	pb "kvstore/proto/raftpb"
 )
 
 // Config holds what a Node needs to start.
 type Config struct {
 	ID        string    // this server's ID
-	Peers     []string  // IDs of all other servers in the cluster
+	Peers     []string  // IDs of all other voting servers (bootstrap config)
 	Transport Transport // used to send RPCs to peers
 	Storage   Storage   // durable home for currentTerm, votedFor, and log[]
 	// ApplyCh, if non-nil, receives each newly applied command in order.
 	// Must be buffered large enough that sends under the node lock never block
 	// (see .cursorrules). The KV layer drains this channel.
 	ApplyCh chan<- ApplyMsg
+	// Join, if true, starts with no voting membership and does not campaign.
+	// The leader adds this server via AddServer and replicates a config (§4.1).
+	Join bool
 }
 
 // ApplyMsg is one committed command ready for the state machine (Phase 4).
@@ -40,26 +45,33 @@ const (
 type Node struct {
 	id        string
 	done      chan struct{}
-	peers     []string
 	transport Transport
 	storage   Storage
 	applyCh   chan<- ApplyMsg
+	bootstrap []string // initial voters if the log has no CONFIG entry
+	join      bool
 
-	mu               sync.Mutex
-	votes            int
-	electionDeadline time.Time
-	lastHeartbeat    time.Time
-	currentTerm      uint64
-	votedFor         string
-	log              []*pb.LogEntry
-	role             Role
-	leaderID         string // last known leader (from AppendEntries); for client redirects
+	mu                sync.Mutex
+	votes             int
+	electionDeadline  time.Time
+	lastHeartbeat     time.Time
+	lastLeaderContact time.Time // for §4.2.3 RequestVote disruption check
+	currentTerm       uint64
+	votedFor          string
+	log               []*pb.LogEntry
+	role              Role
+	leaderID          string // last known leader (from AppendEntries); for client redirects
+
+	// Phase 5: membership from latest CONFIG in log (§4.1), or bootstrap.
+	voters   []string
+	learners []string // non-voting; leader-only until promoted
 
 	// Phase 2: Figure 2 volatile state + leader replication progress.
 	commitIndex uint64
 	lastApplied uint64
 	nextIndex   map[string]uint64 // per-peer; only meaningful when leader
 	matchIndex  map[string]uint64 // per-peer; only meaningful when leader
+	aeOK        map[string]bool   // peer answered AppendEntries successfully (catch-up)
 	applied     [][]byte          // command payloads applied in order (test-facing)
 }
 
@@ -75,11 +87,16 @@ var _ Handler = (*Node)(nil)
 func NewNode(cfg Config) *Node {
 	n := &Node{
 		id:        cfg.ID,
-		peers:     cfg.Peers,
 		transport: cfg.Transport,
 		storage:   cfg.Storage,
 		applyCh:   cfg.ApplyCh,
+		join:      cfg.Join,
 		done:      make(chan struct{}),
+	}
+	if !cfg.Join {
+		n.bootstrap = append([]string{cfg.ID}, cfg.Peers...)
+		slices.Sort(n.bootstrap)
+		n.bootstrap = slices.Compact(n.bootstrap)
 	}
 
 	// Figure 2, "Persistent state": restore what was saved before a restart.
@@ -90,6 +107,8 @@ func NewNode(cfg Config) *Node {
 	n.currentTerm = term
 	n.votedFor = votedFor
 	n.log = log
+	// Dissertation §4.1: membership is the latest config in the log (or bootstrap).
+	n.adoptLatestConfig()
 	return n
 }
 
@@ -129,10 +148,13 @@ func (n *Node) tick() {
 	defer n.mu.Unlock()
 
 	if n.role == Leader {
-		// TODO(Phase 1): step 6, send heartbeats
 		if time.Since(n.lastHeartbeat) >= 50*time.Millisecond {
 			n.sendHeartbeats()
 		}
+		return
+	}
+	// Non-voters (joiners / removed servers) do not campaign (§4.1).
+	if !n.isVoter(n.id) {
 		return
 	}
 	// Figure 2, Rules for Servers (followers and candidates): start an election
@@ -162,8 +184,12 @@ func (n *Node) startElection() {
 		LastLogIndex: lastIndex,
 		LastLogTerm:  lastTerm,
 	}
-	for _, peer := range n.peers {
+	for _, peer := range n.otherVoters() {
 		go n.requestVote(peer, req)
+	}
+	// Single-node cluster: win immediately.
+	if n.votes >= n.majority() {
+		n.becomeLeader()
 	}
 }
 
@@ -171,7 +197,7 @@ func (n *Node) startElection() {
 // The caller must hold n.mu.
 func (n *Node) sendHeartbeats() {
 	n.lastHeartbeat = time.Now()
-	for _, peer := range n.peers {
+	for _, peer := range n.replicationTargets() {
 		n.sendAppendEntries(peer)
 	}
 }
@@ -237,6 +263,10 @@ func (n *Node) appendEntries(peer string, req *pb.AppendEntriesRequest) {
 
 	if resp.Success {
 		// Figure 2, Rules for Servers (leaders): update matchIndex / nextIndex (§5.3).
+		if n.aeOK == nil {
+			n.aeOK = make(map[string]bool)
+		}
+		n.aeOK[peer] = true
 		match := req.PrevLogIndex + uint64(len(req.Entries))
 		if match > n.matchIndex[peer] {
 			n.matchIndex[peer] = match
@@ -274,23 +304,32 @@ func (n *Node) appendEntries(peer string, req *pb.AppendEntriesRequest) {
 
 // maybeCommit advances commitIndex if a majority has replicated an entry from
 // the current term (Figure 2 leader rule; Figure 8 / §5.4.2).
-// The caller must hold n.mu.
+// Majority is over the current voter set (§4.1). Caller must hold n.mu.
 func (n *Node) maybeCommit() {
-	majority := (len(n.peers)+1)/2 + 1
+	maj := n.majority()
 	lastIndex, _ := n.lastLogInfo()
 	for N := lastIndex; N > n.commitIndex; N-- {
 		// Figure 8: only commit entries from the current term this way.
 		if n.log[N-1].Term != n.currentTerm {
 			continue
 		}
-		count := 1 // the leader itself has the entry
-		for _, peer := range n.peers {
+		count := 0
+		// Count the leader only if it is still a voter (may be removing itself).
+		if n.isVoter(n.id) {
+			count = 1
+		}
+		for _, peer := range n.otherVoters() {
 			if n.matchIndex[peer] >= N {
 				count++
 			}
 		}
-		if count >= majority {
+		if count >= maj {
 			n.commitIndex = N
+			// Dissertation §4.1: leader removed from Cnew steps down after commit.
+			if !n.isVoter(n.id) && n.role == Leader {
+				n.role = Follower
+				n.resetElectionTimer()
+			}
 			return
 		}
 	}
@@ -298,11 +337,16 @@ func (n *Node) maybeCommit() {
 
 // applyCommitted applies log[lastApplied+1 .. commitIndex] to the state machine
 // in order (Figure 2, Rules for Servers — all servers).
+// CONFIG entries update membership on append, not here; they are not sent on ApplyCh.
 // The caller must hold n.mu.
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		data := append([]byte(nil), n.log[n.lastApplied-1].Data...)
+		e := n.log[n.lastApplied-1]
+		if e.Type == pb.EntryType_ENTRY_TYPE_CONFIG {
+			continue
+		}
+		data := append([]byte(nil), e.Data...)
 		n.applied = append(n.applied, data)
 		if n.applyCh != nil {
 			// Buffered ApplyCh only: must not block while holding n.mu.
@@ -338,21 +382,25 @@ func (n *Node) requestVote(peer string, req *pb.RequestVoteRequest) {
 
 	if resp.VoteGranted {
 		n.votes++
-		// Majority of the full cluster (self + peers).
-		majority := (len(n.peers)+1)/2 + 1
-		if n.votes >= majority {
-			n.role = Leader
-			n.nextIndex = make(map[string]uint64)
-			n.matchIndex = make(map[string]uint64)
-			lastIndex, _ := n.lastLogInfo()
-			for _, peer := range n.peers {
-				n.nextIndex[peer] = lastIndex + 1 // optimistic (Figure 2)
-				n.matchIndex[peer] = 0
-			}
-			n.lastHeartbeat = time.Time{} // send heartbeats immediately in tick()
-			// TODO(Phase 1): step 6 will send heartbeats from tick()
+		if n.votes >= n.majority() {
+			n.becomeLeader()
 		}
 	}
+}
+
+// becomeLeader transitions from candidate to leader. Caller must hold n.mu.
+func (n *Node) becomeLeader() {
+	n.role = Leader
+	n.leaderID = n.id
+	n.nextIndex = make(map[string]uint64)
+	n.matchIndex = make(map[string]uint64)
+	n.aeOK = make(map[string]bool)
+	lastIndex, _ := n.lastLogInfo()
+	for _, peer := range n.replicationTargets() {
+		n.nextIndex[peer] = lastIndex + 1 // optimistic (Figure 2)
+		n.matchIndex[peer] = 0
+	}
+	n.lastHeartbeat = time.Time{} // send heartbeats immediately in tick()
 }
 
 // State reports the node's current term and whether it believes it is the leader.
@@ -443,6 +491,12 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// Dissertation §4.2.3: ignore RequestVote if we heard from a current leader
+	// within the minimum election timeout (avoids disruption by removed servers).
+	if !n.lastLeaderContact.IsZero() && time.Since(n.lastLeaderContact) < minElectionTimeout {
+		return &pb.RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
+	}
+
 	// Figure 2, RequestVote receiver rule 1: reject a candidate from an older term.
 	if req.Term < n.currentTerm {
 		return &pb.RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
@@ -455,6 +509,11 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 		n.role = Follower
 		n.votedFor = ""
 		n.persistState()
+	}
+
+	// Non-voters do not grant votes (§4.1).
+	if !n.isVoter(n.id) {
+		return &pb.RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
 	}
 
 	// §5.4.1: the candidate's log is at least as up-to-date if its last term is
@@ -537,6 +596,7 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	// A candidate that hears from the leader steps down.
 	n.role = Follower
 	n.leaderID = req.LeaderId
+	n.lastLeaderContact = time.Now()
 	n.resetElectionTimer()
 
 	// Figure 2, AppendEntries receiver rule 2: log consistency check.
@@ -567,6 +627,7 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 
 	// Figure 2, AppendEntries receiver rules 3–4: truncate conflicts, then append.
 	// Each change is saved before the reply below (Figure 2, "Persistent state").
+	logChanged := false
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + uint64(i) + 1
 		if idx <= uint64(len(n.log)) {
@@ -575,12 +636,18 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 				n.persistTruncate(idx)
 				n.log = append(n.log, entry)
 				n.persistAppend(entry)
+				logChanged = true
 			}
 			// else: identical entry already present; leave it
 		} else {
 			n.log = append(n.log, entry)
 			n.persistAppend(entry)
+			logChanged = true
 		}
+	}
+	// §4.1: membership tracks the latest CONFIG in the log (committed or not).
+	if logChanged {
+		n.adoptLatestConfig()
 	}
 
 	// Figure 2, AppendEntries receiver rule 5: adopt leader's commit index.

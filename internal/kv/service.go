@@ -12,6 +12,12 @@ import (
 // addrOf maps Raft node id → client-facing gRPC address (for leader hints).
 type addrOf map[string]string
 
+// PeerDialer updates Raft transport peer addresses when membership changes.
+type PeerDialer interface {
+	SetPeer(id, addr string)
+	RemovePeer(id string)
+}
+
 // Service is the gRPC KV API backed by Raft + Store.
 type Service struct {
 	pb.UnimplementedKVServer
@@ -20,6 +26,7 @@ type Service struct {
 	store   *Store
 	applyCh <-chan raft.ApplyMsg
 	addrs   addrOf
+	peers   PeerDialer // optional; used by AddServer/RemoveServer
 
 	mu      sync.Mutex
 	waiters map[uint64]chan ApplyResult // index → waiter
@@ -29,11 +36,17 @@ type Service struct {
 // NewService wires Raft apply notifications into the store.
 // applyCh must be the same channel passed to raft.Config.ApplyCh.
 func NewService(n *raft.Node, store *Store, applyCh <-chan raft.ApplyMsg, addrs map[string]string) *Service {
+	return NewServiceWithPeers(n, store, applyCh, addrs, nil)
+}
+
+// NewServiceWithPeers is NewService plus a PeerDialer for dynamic membership.
+func NewServiceWithPeers(n *raft.Node, store *Store, applyCh <-chan raft.ApplyMsg, addrs map[string]string, peers PeerDialer) *Service {
 	s := &Service{
 		raft:    n,
 		store:   store,
 		applyCh: applyCh,
 		addrs:   addrs,
+		peers:   peers,
 		waiters: map[uint64]chan ApplyResult{},
 		done:    map[uint64]ApplyResult{},
 	}
@@ -149,14 +162,43 @@ func (s *Service) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Delete
 
 func (s *Service) AddServer(ctx context.Context, req *pb.AddServerRequest) (*pb.AddServerResponse, error) {
 	_ = ctx
-	_ = req
-	return &pb.AddServerResponse{Status: pb.Status_STATUS_NOT_LEADER, LeaderHint: s.leaderHint()}, nil
+	if req.Addr != "" {
+		s.mu.Lock()
+		if s.addrs == nil {
+			s.addrs = addrOf{}
+		}
+		s.addrs[req.Id] = req.Addr
+		s.mu.Unlock()
+		if s.peers != nil {
+			s.peers.SetPeer(req.Id, req.Addr)
+		}
+	}
+	st := membershipStatus(s.raft.AddServer(req.Id))
+	return &pb.AddServerResponse{Status: st, LeaderHint: s.leaderHint()}, nil
 }
 
 func (s *Service) RemoveServer(ctx context.Context, req *pb.RemoveServerRequest) (*pb.RemoveServerResponse, error) {
 	_ = ctx
-	_ = req
-	return &pb.RemoveServerResponse{Status: pb.Status_STATUS_NOT_LEADER, LeaderHint: s.leaderHint()}, nil
+	st := membershipStatus(s.raft.RemoveServer(req.Id))
+	if st == pb.Status_STATUS_OK && s.peers != nil {
+		s.peers.RemovePeer(req.Id)
+	}
+	return &pb.RemoveServerResponse{Status: st, LeaderHint: s.leaderHint()}, nil
+}
+
+func membershipStatus(ms raft.MembershipStatus) pb.Status {
+	switch ms {
+	case raft.MembershipOK:
+		return pb.Status_STATUS_OK
+	case raft.MembershipNotLeader:
+		return pb.Status_STATUS_NOT_LEADER
+	case raft.MembershipInProgress:
+		return pb.Status_STATUS_CONFIG_CHANGE_IN_PROGRESS
+	case raft.MembershipTimeout:
+		return pb.Status_STATUS_TIMEOUT
+	default:
+		return pb.Status_STATUS_TIMEOUT
+	}
 }
 
 const waitTimeout = 2 * time.Second

@@ -19,7 +19,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "usage: client [--addrs a,b,c] put KEY VALUE | get KEY | delete KEY\n")
+		fmt.Fprintf(os.Stderr, "usage: client [--addrs a,b,c] put KEY VALUE | get KEY | delete KEY | add-server ID ADDR | remove-server ID\n")
 		os.Exit(2)
 	}
 
@@ -90,6 +90,36 @@ func main() {
 			fatal(err.Error())
 		}
 		fmt.Println("ok")
+	case "add-server":
+		if len(args) != 3 {
+			fatal("add-server ID ADDR")
+		}
+		err := withRetry(ctx, servers, func(ctx context.Context, cl pb.KVClient, hint *string) error {
+			resp, err := cl.AddServer(ctx, &pb.AddServerRequest{Id: args[1], Addr: args[2]})
+			if err != nil {
+				return err
+			}
+			return mapStatus(resp.Status, resp.LeaderHint, hint)
+		})
+		if err != nil {
+			fatal(err.Error())
+		}
+		fmt.Println("ok")
+	case "remove-server":
+		if len(args) != 2 {
+			fatal("remove-server ID")
+		}
+		err := withRetry(ctx, servers, func(ctx context.Context, cl pb.KVClient, hint *string) error {
+			resp, err := cl.RemoveServer(ctx, &pb.RemoveServerRequest{Id: args[1]})
+			if err != nil {
+				return err
+			}
+			return mapStatus(resp.Status, resp.LeaderHint, hint)
+		})
+		if err != nil {
+			fatal(err.Error())
+		}
+		fmt.Println("ok")
 	default:
 		fatal("unknown command " + args[0])
 	}
@@ -104,6 +134,8 @@ func mapStatus(st pb.Status, leaderHint string, hint *string) error {
 		return errNotLeader
 	case pb.Status_STATUS_TIMEOUT:
 		return fmt.Errorf("timeout (safe to retry with same seq)")
+	case pb.Status_STATUS_CONFIG_CHANGE_IN_PROGRESS:
+		return fmt.Errorf("config change in progress")
 	default:
 		return fmt.Errorf("status %v", st)
 	}
