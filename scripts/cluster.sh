@@ -11,6 +11,7 @@ mkdir -p "$BIN" "$DATA"
 cd "$ROOT"
 go build -o "$BIN/server" ./cmd/server
 go build -o "$BIN/client" ./cmd/client
+go build -o "$BIN/bench" ./cmd/bench
 
 # Kill previous cluster from this script, if any.
 if [[ -f "$DATA/pids" ]]; then

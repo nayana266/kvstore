@@ -155,12 +155,12 @@ func (n *Node) appendConfigEntry(voters []string) uint64 {
 		Data:  encodeConfig(voters),
 	}
 	n.log = append(n.log, entry)
-	n.persistAppend(entry)
+	n.unstable = append(n.unstable, entry)
 	n.adoptLatestConfig()
 	for _, peer := range n.replicationTargets() {
 		n.ensurePeerProgress(peer)
 	}
-	n.sendHeartbeats()
+	n.sendHeartbeats() // flushes unstable then replicates
 	return index
 }
 
@@ -172,7 +172,7 @@ func (n *Node) waitForCommit(index uint64, timeout time.Duration) bool {
 		ok := n.commitIndex >= index
 		// Leader that removed itself steps down once Cnew commits (§4.1).
 		if ok && n.role == Leader && !n.isVoter(n.id) {
-			n.role = Follower
+			n.stepDown()
 			n.resetElectionTimer()
 		}
 		n.mu.Unlock()

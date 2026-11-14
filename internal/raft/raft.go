@@ -73,7 +73,15 @@ type Node struct {
 	matchIndex  map[string]uint64 // per-peer; only meaningful when leader
 	aeOK        map[string]bool   // peer answered AppendEntries successfully (catch-up)
 	applied     [][]byte          // command payloads applied in order (test-facing)
+
+	// Phase 6: leader entries accepted but not yet fsynced. Flushed in one
+	// storage.Append (+ one Sync) before any AppendEntries that could send them.
+	unstable []*pb.LogEntry
 }
+
+// maxProposeBatch flushes when this many unpersisted entries accumulate so
+// memory and recover-after-crash window stay bounded under load.
+const maxProposeBatch = 64
 
 // LogEntryView is a read-only snapshot of one log entry for tests.
 type LogEntryView struct {
@@ -148,7 +156,8 @@ func (n *Node) tick() {
 	defer n.mu.Unlock()
 
 	if n.role == Leader {
-		if time.Since(n.lastHeartbeat) >= 50*time.Millisecond {
+		// Flush+replicate as soon as there is a batch, else idle heartbeats (~50ms).
+		if len(n.unstable) > 0 || time.Since(n.lastHeartbeat) >= 50*time.Millisecond {
 			n.sendHeartbeats()
 		}
 		return
@@ -194,12 +203,31 @@ func (n *Node) startElection() {
 }
 
 // sendHeartbeats / replicate: send AppendEntries to every peer (§5.3).
-// The caller must hold n.mu.
+// Persists any unstable leader entries first so followers never see log that
+// this node could lose on crash. The caller must hold n.mu.
 func (n *Node) sendHeartbeats() {
+	n.flushUnstable()
 	n.lastHeartbeat = time.Now()
 	for _, peer := range n.replicationTargets() {
 		n.sendAppendEntries(peer)
 	}
+}
+
+// flushUnstable writes all queued leader entries in one storage.Append (one fsync).
+// The caller must hold n.mu.
+func (n *Node) flushUnstable() {
+	if len(n.unstable) == 0 {
+		return
+	}
+	n.persistAppend(n.unstable...)
+	n.unstable = nil
+}
+
+// stepDown becomes follower after durably flushing any leader-only queue.
+// The caller must hold n.mu.
+func (n *Node) stepDown() {
+	n.flushUnstable()
+	n.role = Follower
 }
 
 // sendAppendEntries builds a peer-specific AppendEntries and sends it.
@@ -249,7 +277,7 @@ func (n *Node) appendEntries(peer string, req *pb.AppendEntriesRequest) {
 	// Figure 2, Rules for Servers (all servers): step down on a higher term.
 	if resp.Term > n.currentTerm {
 		n.currentTerm = resp.Term
-		n.role = Follower
+		n.stepDown()
 		n.votedFor = ""
 		n.persistState()
 		n.resetElectionTimer()
@@ -327,7 +355,7 @@ func (n *Node) maybeCommit() {
 			n.commitIndex = N
 			// Dissertation §4.1: leader removed from Cnew steps down after commit.
 			if !n.isVoter(n.id) && n.role == Leader {
-				n.role = Follower
+				n.stepDown()
 				n.resetElectionTimer()
 			}
 			return
@@ -369,7 +397,7 @@ func (n *Node) requestVote(peer string, req *pb.RequestVoteRequest) {
 	// Figure 2, Rules for Servers (all servers): step down on a higher term.
 	if resp.Term > n.currentTerm {
 		n.currentTerm = resp.Term
-		n.role = Follower
+		n.stepDown()
 		n.votedFor = ""
 		n.persistState()
 		return
@@ -413,6 +441,10 @@ func (n *Node) State() (term uint64, isLeader bool) {
 // Propose asks this node to append cmd to the Raft log.
 // ok is false if this node is not the leader (caller should retry elsewhere).
 // index is the log index of the new entry when ok is true (Phase 4 waits on it).
+//
+// Phase 6: the entry is queued in unstable and fsynced in a batch with other
+// proposes (one disk Sync + one AppendEntries round) on the next tick or when
+// maxProposeBatch is reached.
 func (n *Node) Propose(cmd []byte) (index uint64, ok bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -422,7 +454,7 @@ func (n *Node) Propose(cmd []byte) (index uint64, ok bool) {
 		return 0, false
 	}
 
-	// 2) New entry goes at the end of the log.
+	// 2) New entry goes at the end of the log (durable flush deferred).
 	lastIndex, _ := n.lastLogInfo()
 	index = lastIndex + 1
 	entry := &pb.LogEntry{
@@ -432,9 +464,11 @@ func (n *Node) Propose(cmd []byte) (index uint64, ok bool) {
 		Data:  cmd,
 	}
 	n.log = append(n.log, entry)
-	n.persistAppend(entry)
+	n.unstable = append(n.unstable, entry)
 	n.leaderID = n.id
-	n.sendHeartbeats()
+	if len(n.unstable) >= maxProposeBatch {
+		n.sendHeartbeats()
+	}
 
 	return index, true
 }
@@ -506,7 +540,7 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 	// is out of date, so adopt the term and become a follower (§5.1).
 	if req.Term > n.currentTerm {
 		n.currentTerm = req.Term
-		n.role = Follower
+		n.stepDown()
 		n.votedFor = ""
 		n.persistState()
 	}
@@ -593,8 +627,8 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	}
 
 	// §5.2: the sender is the leader for this term, so this node is a follower.
-	// A candidate that hears from the leader steps down.
-	n.role = Follower
+	// Flush any leader queue before accepting someone else's log.
+	n.stepDown()
 	n.leaderID = req.LeaderId
 	n.lastLeaderContact = time.Now()
 	n.resetElectionTimer()
@@ -626,24 +660,29 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	}
 
 	// Figure 2, AppendEntries receiver rules 3–4: truncate conflicts, then append.
-	// Each change is saved before the reply below (Figure 2, "Persistent state").
+	// Batch new entries into one storage.Append (one fsync) before replying.
 	logChanged := false
+	var toPersist []*pb.LogEntry
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + uint64(i) + 1
 		if idx <= uint64(len(n.log)) {
 			if n.log[idx-1].Term != entry.Term {
 				n.log = n.log[:idx-1] // delete conflicting entry and everything after
+				n.unstable = nil
 				n.persistTruncate(idx)
 				n.log = append(n.log, entry)
-				n.persistAppend(entry)
+				toPersist = append(toPersist, entry)
 				logChanged = true
 			}
 			// else: identical entry already present; leave it
 		} else {
 			n.log = append(n.log, entry)
-			n.persistAppend(entry)
+			toPersist = append(toPersist, entry)
 			logChanged = true
 		}
+	}
+	if len(toPersist) > 0 {
+		n.persistAppend(toPersist...)
 	}
 	// §4.1: membership tracks the latest CONFIG in the log (committed or not).
 	if logChanged {

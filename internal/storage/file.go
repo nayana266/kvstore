@@ -6,9 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"google.golang.org/protobuf/proto"
-	"encoding/json"
 	"encoding/binary"
+	"encoding/json"
+	"google.golang.org/protobuf/proto"
 	pb "kvstore/proto/raftpb"
 )
 
@@ -37,11 +37,13 @@ type FileStorage struct {
 	votedFor string
 	log      []*pb.LogEntry
 }
+
 // stateRecord is the contents of the state file.
 type stateRecord struct {
 	Term     uint64 `json:"term"`
 	VotedFor string `json:"votedFor"`
 }
+
 // Open opens (or creates) the storage in dir.
 func Open(dir string) (*FileStorage, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -66,7 +68,7 @@ func Open(dir string) (*FileStorage, error) {
 		s.term = st.Term
 		s.votedFor = st.VotedFor
 	}
-	
+
 	raw, err := os.ReadFile(filepath.Join(dir, logFile))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -106,8 +108,6 @@ func (s *FileStorage) Close() error {
 	return s.logFile.Close()
 }
 
-
-
 // SaveState durably records currentTerm and votedFor.
 // SaveState durably records currentTerm and votedFor.
 func (s *FileStorage) SaveState(term uint64, votedFor string) error {
@@ -146,9 +146,12 @@ func (s *FileStorage) SaveState(term uint64, votedFor string) error {
 	return nil
 }
 
-// Append durably adds entries to the end of the log.
-// Append durably adds entries to the end of the log.
+// Append durably adds entries to the end of the log in one write + one fsync.
+// Callers should batch when possible (Phase 6) so many Raft entries share a Sync.
 func (s *FileStorage) Append(entries []*pb.LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
 	var buf []byte
 	for _, e := range entries {
 		data, err := proto.Marshal(e)
@@ -261,4 +264,3 @@ func (s *FileStorage) TruncateFrom(index uint64) error {
 	s.log = kept
 	return nil
 }
-
