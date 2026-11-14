@@ -60,7 +60,7 @@ func TestOverwriteUncommitted(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	submitted := false
 	for time.Now().Before(deadline) {
-		if c.node(oldLeader).Propose(cmd("orphan")) {
+		if _, ok := c.node(oldLeader).Propose(cmd("orphan")); ok {
 			submitted = true
 			break
 		}

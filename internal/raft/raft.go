@@ -15,6 +15,16 @@ type Config struct {
 	Peers     []string  // IDs of all other servers in the cluster
 	Transport Transport // used to send RPCs to peers
 	Storage   Storage   // durable home for currentTerm, votedFor, and log[]
+	// ApplyCh, if non-nil, receives each newly applied command in order.
+	// Must be buffered large enough that sends under the node lock never block
+	// (see .cursorrules). The KV layer drains this channel.
+	ApplyCh chan<- ApplyMsg
+}
+
+// ApplyMsg is one committed command ready for the state machine (Phase 4).
+type ApplyMsg struct {
+	Index uint64
+	Data  []byte
 }
 
 // Role is a server's current role.
@@ -33,6 +43,7 @@ type Node struct {
 	peers     []string
 	transport Transport
 	storage   Storage
+	applyCh   chan<- ApplyMsg
 
 	mu               sync.Mutex
 	votes            int
@@ -42,6 +53,7 @@ type Node struct {
 	votedFor         string
 	log              []*pb.LogEntry
 	role             Role
+	leaderID         string // last known leader (from AppendEntries); for client redirects
 
 	// Phase 2: Figure 2 volatile state + leader replication progress.
 	commitIndex uint64
@@ -66,6 +78,7 @@ func NewNode(cfg Config) *Node {
 		peers:     cfg.Peers,
 		transport: cfg.Transport,
 		storage:   cfg.Storage,
+		applyCh:   cfg.ApplyCh,
 		done:      make(chan struct{}),
 	}
 
@@ -289,8 +302,12 @@ func (n *Node) maybeCommit() {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		data := n.log[n.lastApplied-1].Data
-		n.applied = append(n.applied, append([]byte(nil), data...))
+		data := append([]byte(nil), n.log[n.lastApplied-1].Data...)
+		n.applied = append(n.applied, data)
+		if n.applyCh != nil {
+			// Buffered ApplyCh only: must not block while holding n.mu.
+			n.applyCh <- ApplyMsg{Index: n.lastApplied, Data: data}
+		}
 	}
 }
 
@@ -346,33 +363,46 @@ func (n *Node) State() (term uint64, isLeader bool) {
 }
 
 // Propose asks this node to append cmd to the Raft log.
-// Returns false if this node is not the leader (caller should retry elsewhere).
-func (n *Node) Propose(cmd []byte) bool {
+// ok is false if this node is not the leader (caller should retry elsewhere).
+// index is the log index of the new entry when ok is true (Phase 4 waits on it).
+func (n *Node) Propose(cmd []byte) (index uint64, ok bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	// 1) Only the leader accepts client commands (Figure 2 / §5.3).
 	if n.role != Leader {
-		return false
+		return 0, false
 	}
 
 	// 2) New entry goes at the end of the log.
-	lastIndex, _ := n.lastLogInfo() // hint: last log index + 1. Use n.lastLogInfo()
-	index := lastIndex + 1
+	lastIndex, _ := n.lastLogInfo()
+	index = lastIndex + 1
 	entry := &pb.LogEntry{
-		Term:  n.currentTerm, // this leader's term
+		Term:  n.currentTerm,
 		Index: index,
 		Type:  pb.EntryType_ENTRY_TYPE_NORMAL,
 		Data:  cmd,
 	}
 	n.log = append(n.log, entry)
 	n.persistAppend(entry)
-	// 3) Optional for later: kick replication immediately so you don't wait
-	//    for the next 50ms heartbeat. You can leave this out for now.
+	n.leaderID = n.id
 	n.sendHeartbeats()
 
-	return true
+	return index, true
 }
+
+// LeaderID returns the last known leader id (empty if unknown). Used for client redirects.
+func (n *Node) LeaderID() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role == Leader {
+		return n.id
+	}
+	return n.leaderID
+}
+
+// ID returns this node's id.
+func (n *Node) ID() string { return n.id }
 
 // Applied returns a copy of command payloads applied to the state machine,
 // in commit order (Figure 2, All Servers: apply when commitIndex > lastApplied).
@@ -506,6 +536,7 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	// §5.2: the sender is the leader for this term, so this node is a follower.
 	// A candidate that hears from the leader steps down.
 	n.role = Follower
+	n.leaderID = req.LeaderId
 	n.resetElectionTimer()
 
 	// Figure 2, AppendEntries receiver rule 2: log consistency check.

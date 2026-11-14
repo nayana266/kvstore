@@ -201,7 +201,7 @@ func (c *testCluster) propose(ids []string, cmd []byte) {
 	deadline := time.Now().Add(applyWait)
 	for time.Now().Before(deadline) {
 		leader, _ := c.checkOneLeader(ids)
-		if c.node(leader).Propose(cmd) {
+		if _, ok := c.node(leader).Propose(cmd); ok {
 			return
 		}
 		time.Sleep(pollInterval)
