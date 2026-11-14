@@ -42,6 +42,15 @@ fsync of the Raft log; numbers without batching are expected to be low.
 
 ## Chaos (Phase 7)
 
+Harness: `go run ./cmd/chaos -scenario crash|restart|isolate|partition -duration 15s -seed N`
+
+Correctness: ack read-back of every successful Put, then Porcupine on Put history + post-heal Gets.
+
 | Scenario | seed | passes | notes |
 |---|---|---|---|
-|  |  |  |  |
+| crash | 1 | yes | 719 acks; porcupine 1438 ops |
+| restart | 4 | yes | 1357 acks; porcupine 2714 ops |
+| isolate | 2 | yes | 2249 acks; porcupine 4498 ops |
+| partition | 3 | yes | 2580 acks; porcupine 5160 ops |
+
+All runs: 3 nodes, same machine, `-duration 9s`, 2026-11-14.

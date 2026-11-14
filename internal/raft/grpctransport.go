@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -9,8 +10,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"kvstore/internal/partition"
 	pb "kvstore/proto/raftpb"
 )
+
+// ErrPartitioned is returned when the local block list drops an RPC.
+var ErrPartitioned = errors.New("raft: peer partitioned")
 
 // GRPCTransport is a Raft Transport over gRPC. Peer ids map to dial addresses.
 type GRPCTransport struct {
@@ -19,15 +24,22 @@ type GRPCTransport struct {
 	peers   map[string]string // id → "host:port"
 	conns   map[string]*grpc.ClientConn
 	clients map[string]pb.RaftClient
+	blocks  *partition.BlockList // optional; chaos harness partitions
 }
 
 // NewGRPCTransport builds a client-side transport. Call Close when done.
 func NewGRPCTransport(localID string, peers map[string]string) *GRPCTransport {
+	return NewGRPCTransportWithBlocks(localID, peers, nil)
+}
+
+// NewGRPCTransportWithBlocks is NewGRPCTransport plus a shared BlockList.
+func NewGRPCTransportWithBlocks(localID string, peers map[string]string, blocks *partition.BlockList) *GRPCTransport {
 	return &GRPCTransport{
 		localID: localID,
 		peers:   peers,
 		conns:   map[string]*grpc.ClientConn{},
 		clients: map[string]pb.RaftClient{},
+		blocks:  blocks,
 	}
 }
 
@@ -52,19 +64,25 @@ func (t *GRPCTransport) client(to string) (pb.RaftClient, error) {
 }
 
 func (t *GRPCTransport) RequestVote(ctx context.Context, to string, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	if t.blocks != nil && t.blocks.Blocked(to) {
+		return nil, ErrPartitioned
+	}
 	cl, err := t.client(to)
 	if err != nil {
 		return nil, err
 	}
-	return cl.RequestVote(ctx, req)
+	return cl.RequestVote(partition.ContextWithPeer(ctx, t.localID), req)
 }
 
 func (t *GRPCTransport) AppendEntries(ctx context.Context, to string, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	if t.blocks != nil && t.blocks.Blocked(to) {
+		return nil, ErrPartitioned
+	}
 	cl, err := t.client(to)
 	if err != nil {
 		return nil, err
 	}
-	return cl.AppendEntries(ctx, req)
+	return cl.AppendEntries(partition.ContextWithPeer(ctx, t.localID), req)
 }
 
 // SetPeer registers or updates the dial address for a peer (Phase 5 AddServer).
@@ -127,14 +145,13 @@ func ServeRaft(srv *grpc.Server, h Handler) {
 	pb.RegisterRaftServer(srv, &raftServer{h: h})
 }
 
-// Listen starts a gRPC server on addr that serves Raft (and any other services
-// already registered on the returned server before Serve is called).
-// Prefer registering KV on the same server in cmd/server.
-func Listen(addr string) (*grpc.Server, net.Listener, error) {
+// Listen starts a gRPC server on addr. Optional grpc.ServerOption values
+// (e.g. unary interceptors for chaos partitions) are passed through.
+func Listen(addr string, opts ...grpc.ServerOption) (*grpc.Server, net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, err
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(opts...)
 	return srv, ln, nil
 }

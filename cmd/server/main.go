@@ -10,9 +10,14 @@ import (
 	"strings"
 	"syscall"
 
+	"google.golang.org/grpc"
+
+	"kvstore/internal/chaos"
 	"kvstore/internal/kv"
+	"kvstore/internal/partition"
 	"kvstore/internal/raft"
 	"kvstore/internal/storage"
+	adminpb "kvstore/proto/adminpb"
 	pb "kvstore/proto/kvpb"
 )
 
@@ -55,8 +60,9 @@ func main() {
 	}
 	defer st.Close()
 
+	blocks := partition.NewBlockList(*id)
 	applyCh := make(chan raft.ApplyMsg, 10_000)
-	tr := raft.NewGRPCTransport(*id, peerAddrs)
+	tr := raft.NewGRPCTransportWithBlocks(*id, peerAddrs, blocks)
 	defer tr.Close()
 
 	node := raft.NewNode(raft.Config{
@@ -67,7 +73,7 @@ func main() {
 		ApplyCh:   applyCh,
 	})
 
-	srv, ln, err := raft.Listen(*addr)
+	srv, ln, err := raft.Listen(*addr, grpc.UnaryInterceptor(blocks.UnaryServerInterceptor()))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -76,6 +82,7 @@ func main() {
 	store := kv.NewStore()
 	kvSvc := kv.NewServiceWithPeers(node, store, applyCh, allAddrs, tr)
 	pb.RegisterKVServer(srv, kvSvc)
+	adminpb.RegisterAdminServer(srv, chaos.NewAdminServer(blocks))
 
 	node.Start()
 	defer node.Stop()

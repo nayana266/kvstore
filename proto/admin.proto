@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package kvstore.admin;
+
+option go_package = "kvstore/proto/adminpb;adminpb";
+
+// Admin is for the chaos harness / operators. Not part of the KV API.
+service Admin {
+  // SetBlockList replaces the set of peer ids whose Raft RPCs this node drops
+  // (inbound and outbound). Empty clears the partition.
+  rpc SetBlockList(SetBlockListRequest) returns (SetBlockListResponse);
+  rpc GetBlockList(GetBlockListRequest) returns (GetBlockListResponse);
+}
+
+message SetBlockListRequest {
+  repeated string peer_ids = 1; // drop Raft traffic to/from these ids
+}
+
+message SetBlockListResponse {}
+
+message GetBlockListRequest {}
+
+message GetBlockListResponse {
+  repeated string peer_ids = 1;
+}
